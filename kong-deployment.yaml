@@ -1,0 +1,176 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: sre
+  name: kong
+  labels:
+    app: kong
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: sre
+  name: kong-control-plane
+  labels:
+    app: kong-control-plane
+spec:
+  selector:
+    matchLabels:
+      app: kong-control-plane
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  replicas: 3
+  template:
+    metadata:
+      annotations:
+        k8s.konghq.com/sidecar-inject: "false"
+      labels:
+        app: kong-control-plane
+    spec:
+      serviceAccountName: kong
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox:latest
+        imagePullPolicy: IfNotPresent
+        env:
+          - name: KONG_PG_PORT
+            value: "5432"
+          - name: KONG_PG_HOST
+            value: postgres-kong.sre.svc.cluster.local
+        command: [ "/bin/sh", "-c", "until nc -zv $KONG_PG_HOST $KONG_PG_PORT -w1; do echo 'waiting for db'; sleep 1; done" ]
+      - name: kong-migration-up
+        image: kong
+        imagePullPolicy: IfNotPresent
+        env:
+          - name: KONG_PG_PASSWORD
+            value: kongkong
+          - name: KONG_PG_HOST
+            value: postgres-kong.sre.svc.cluster.local
+          - name: KONG_NGINX_WORKER_PROCESSES
+            value: "1"
+        command: [ "/bin/sh", "-c", "kong migrations up && kong migrations finish" ]
+      containers:
+      - name: kong-control-plane
+        image: kong
+        imagePullPolicy: IfNotPresent
+        env:
+          - name: KONG_PG_PASSWORD
+            value: kongkong
+          - name: KONG_PG_HOST
+            value: postgres-kong.sre.svc.cluster.local
+          - name: KONG_LOG_LEVEL
+            value: info
+          - name: KONG_ADMIN_ACCESS_LOG
+            value: /dev/stdout
+          - name: KONG_PROXY_ERROR_LOG
+            value: /dev/stdout
+          - name: KONG_ADMIN_ERROR_LOG
+            value: /dev/stdout
+          - name: KONG_ADMIN_LISTEN
+            value: 0.0.0.0:8001,0.0.0.0:8000
+          - name: KONG_NGINX_WORKER_PROCESSES
+            value: "1"
+        ports:
+        - name: admin-http
+          containerPort: 8001
+        - name: admin-https
+          containerPort: 8000
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /status
+            port: 8001
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /status
+            port: 8001
+            scheme: HTTP
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: sre
+  name: kong-control-plane
+spec:
+  type: ClusterIP
+  ports:
+    - name: kong-admin
+      port: 8001
+    - name: kong-proxy
+      port: 8000
+  selector:
+    app: kong-control-plane
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  namespace: sre
+  name: kong-control-plane-bootstrap
+  labels:
+    app: kong-control-plane-bootstrap
+spec:
+  template:
+    metadata:
+      name: kong-control-plane-bootstrap
+      labels:
+        app: kong-control-plane
+    spec:
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox:latest
+        imagePullPolicy: IfNotPresent
+        env:
+          - name: KONG_PG_PORT
+            value: "5432"
+          - name: KONG_PG_HOST
+            value: postgres-kong.sre.svc.cluster.local
+        command: [ "/bin/sh", "-c", "until nc -zv $KONG_PG_HOST $KONG_PG_PORT -w1; do echo 'waiting for db'; sleep 1; done" ]
+      containers:
+      - name: kong-migration-boostrap
+        image: kong
+        imagePullPolicy: IfNotPresent
+        env:
+          - name: KONG_PG_PASSWORD
+            value: kongkong
+          - name: KONG_PG_HOST
+            value: postgres-kong.sre.svc.cluster.local
+          - name: KONG_NGINX_WORKER_PROCESSES
+            value: "1"
+        command: [ "kong", "migrations", "bootstrap" ]
+      restartPolicy: OnFailure
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: kong-private-rules
+  namespace: sre
+  annotations:
+    kubernetes.io/ingress.class: traefik-private
+spec:
+  rules:
+  - host: kong-admin.eu-west-1.dev.sre.ef-cloud.io
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: kong-control-plane
+          servicePort: 8001
+  - host: whisperer-kong.eu-west-1.dev.sre.ef-cloud.io
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: kong-control-plane
+          servicePort: 8000
